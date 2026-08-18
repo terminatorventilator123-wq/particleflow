@@ -5,9 +5,8 @@
 #  - ./tools/block-users.sh --dry-run
 #  - ./tools/block-users.sh --file=my-users.txt
 #
-# This script uses the `gh` CLI to block users on behalf of the authenticated account.
-# It validates usernames, skips blank/comment lines, supports dry-run, retries transient failures,
-# and prints a summary at the end.
+# Tento skript používá gh CLI k (od)blokování uživatelů za autentizovaný účet.
+# Supports: dry-run, unblock, logging with rotation, concurrency, rate-limiting, retries.
 
 set -euo pipefail
 
@@ -15,6 +14,43 @@ DRY_RUN=false
 USERS_FILE="users.txt"
 AUTO_YES=false
 MAX_RETRIES=3
+CONCURRENCY=4
+RATE_PER_SEC=1   # approximate per-worker rate limit (requests per second)
+LOG_DIR="logs"
+LOG_FILE="logs/block-users.log"
+MAX_LOG_BYTES=$((10 * 1024 * 1024))  # 10 MB
+MAX_ROTATIONS=5
+ACTION="block" # or "unblock"
+
+print_help() {
+  cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  --dry-run            Don't actually call GitHub; just print the commands.
+  --file FILE          Read usernames from FILE (default: users.txt).
+  --yes                Skip confirmation prompt when not in dry-run.
+  --log FILE           Path to log file (default: ${LOG_FILE}).
+  --max-log-bytes N    Rotate when log reaches N bytes (default: ${MAX_LOG_BYTES}).
+  --rotations N        Keep at most N rotated logs (default: ${MAX_ROTATIONS}).
+  --unblock            Unblock users instead of blocking them.
+  --concurrency N      Number of parallel workers (default: ${CONCURRENCY}).
+  --rate R             Approximate requests per second per worker (default: ${RATE_PER_SEC}).
+  -h, --help           Show this help and exit.
+
+Česky:
+  --dry-run            Nepouštět žádné volání na GitHub; jen vypíše příkazy.
+  --file SOUBOR        Číst uživatele ze souboru (výchozí: users.txt).
+  --yes                Přeskočit potvrzovací dotaz.
+  --log SOUBOR         Cesta k log souboru (výchozí: ${LOG_FILE}).
+  --unblock            Místo blokování odblokuje uživatele.
+  --concurrency N      Počet paralelních workerů.
+
+Examples:
+  $0 --dry-run --file=my-users.txt
+  $0 --file=users.txt --concurrency=8 --rate=2
+EOF
+}
 
 # simple arg parsing
 while [[ "${1:-}" != "" ]]; do
@@ -23,18 +59,43 @@ while [[ "${1:-}" != "" ]]; do
     --file) USERS_FILE="$2"; shift 2 ;;
     --file=*) USERS_FILE="${1#*=}"; shift ;;
     --yes) AUTO_YES=true; shift ;;
-    -h|--help)
-      cat <<EOF
-Usage: $0 [--dry-run] [--file FILE] [--yes]
-  --dry-run     Don't actually call GitHub; just print the commands.
-  --file FILE   Read usernames from FILE (default: users.txt).
-  --yes         Skip confirmation prompt when not in dry-run.
-EOF
-      exit 0
-      ;;
-    *) echo "Unknown option: $1"; exit 2 ;;
+    --log) LOG_FILE="$2"; shift 2 ;;
+    --log=*) LOG_FILE="${1#*=}"; shift ;;
+    --max-log-bytes) MAX_LOG_BYTES="$2"; shift 2 ;;
+    --max-log-bytes=*) MAX_LOG_BYTES="${1#*=}"; shift ;;
+    --rotations) MAX_ROTATIONS="$2"; shift 2 ;;
+    --rotations=*) MAX_ROTATIONS="${1#*=}"; shift ;;
+    --unblock) ACTION="unblock"; shift ;;
+    --concurrency) CONCURRENCY="$2"; shift 2 ;;
+    --concurrency=*) CONCURRENCY="${1#*=}"; shift ;;
+    --rate) RATE_PER_SEC="$2"; shift 2 ;;
+    --rate=*) RATE_PER_SEC="${1#*=}"; shift ;;
+    -h|--help) print_help; exit 0 ;;
+    *) echo "Unknown option: $1"; print_help; exit 2 ;;
   esac
 done
+
+# ensure log dir exists if logging enabled
+mkdir -p "$(dirname "$LOG_FILE")"
+
+log() {
+  ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  printf '%s %s\n' "$ts" "$*" | tee -a "$LOG_FILE"
+}
+
+rotate_logs_if_needed() {
+  if [[ ! -f "$LOG_FILE" ]]; then
+    return
+  fi
+  filesize=$(wc -c <"$LOG_FILE" 2>/dev/null || echo 0)
+  if (( filesize >= MAX_LOG_BYTES )); then
+    ts=$(date +%Y%m%dT%H%M%S)
+    mv "$LOG_FILE" "${LOG_FILE}.${ts}"
+    # remove older rotations
+    ls -1t "${LOG_FILE}."* 2>/dev/null | tail -n +$((MAX_ROTATIONS+1)) | xargs -r rm --
+    log "Rotated log; previous saved as ${LOG_FILE}.${ts}"
+  fi
+}
 
 if [[ ! -f "$USERS_FILE" ]]; then
   echo "Error: users file '$USERS_FILE' not found."
@@ -47,23 +108,20 @@ if ! command -v gh >/dev/null 2>&1; then
 fi
 
 if [[ "$DRY_RUN" != "true" && "$AUTO_YES" != "true" ]]; then
-  read -r -p "About to block users listed in '$USERS_FILE'. Continue? [y/N] " ans
+  read -r -p "About to ${ACTION} users listed in '$USERS_FILE'. Continue? [y/N] " ans
   case "$ans" in
     [Yy]|[Yy][Ee][Ss]) ;;
     *) echo "Aborted."; exit 0 ;;
   esac
 fi
 
-success_count=0
-fail_count=0
-failed_users=()
-
-# read file safe for lines without trailing newline
+# read file and build list of users
+users=()
 while IFS= read -r line || [[ -n "$line" ]]; do
   # remove CR if present (Windows newlines)
   user="${line//$'\r'/}"
 
-  # trim leading and trailing whitespace (but preserve internal spaces if any)
+  # trim leading and trailing whitespace
   user="${user#"${user%%[![:space:]]*}"}"
   user="${user%"${user##*[![:space:]]}"}"
 
@@ -71,53 +129,107 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   [[ -z "$user" ]] && continue
   [[ "${user:0:1}" == "#" ]] && continue
 
-  # basic username validation: conservative (alphanum and hyphen, first char not hyphen, max 39)
+  # basic username validation
   if ! [[ "$user" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]]; then
-    printf 'SKIP: "%s" - invalid username format\n' "$user"
+    log "SKIP: '$user' - invalid username format"
     continue
   fi
+  users+=("$user")
+done < "$USERS_FILE"
 
-  printf 'Blocking %s ... ' "$user"
+total=${#users[@]}
+if (( total == 0 )); then
+  echo "No users to process after filtering."
+  exit 0
+fi
 
-  if [[ "$DRY_RUN" == "true" ]]; then
-    printf 'DRY RUN: gh api -X PUT /user/blocks/%s\n' "$user"
-    ((success_count++))
-    continue
-  fi
+log "Starting ${ACTION} for ${total} users (concurrency=${CONCURRENCY}, rate=${RATE_PER_SEC}, dry-run=${DRY_RUN})"
+rotate_logs_if_needed
 
-  # attempt with retries for transient failures
-  attempt=1
-  blocked=false
+# function to process single user
+process_user() {
+  local user="$1"
+  local attempt=1
+  local success=false
+  local cmd
+
   while (( attempt <= MAX_RETRIES )); do
-    if gh api -X PUT "/user/blocks/$user" >/dev/null 2>&1; then
-      blocked=true
+    if [[ "$DRY_RUN" == "true" ]]; then
+      log "DRY RUN: gh api -X $([[ "$ACTION" == "block" ]] && echo PUT || echo DELETE) /user/blocks/${user}"
+      success=true
       break
+    fi
+
+    if [[ "$ACTION" == "block" ]]; then
+      if gh api -X PUT "/user/blocks/${user}" >/dev/null 2>&1; then
+        success=true
+        break
+      fi
     else
-      # backoff before retrying
-      if (( attempt < MAX_RETRIES )); then
-        sleep $(( attempt * 2 ))
+      if gh api -X DELETE "/user/blocks/${user}" >/dev/null 2>&1; then
+        success=true
+        break
       fi
     fi
+
+    # transient failure, backoff
+    sleep $(( attempt * 2 ))
     ((attempt++))
   done
 
-  if [[ "$blocked" == "true" ]]; then
-    echo "OK"
+  if $success; then
+    log "OK: ${ACTION}ed ${user}"
+    return 0
+  else
+    log "FAILED: could not ${ACTION} ${user} (attempts=${MAX_RETRIES})"
+    return 1
+  fi
+}
+
+# worker pool: launch background jobs and limit concurrency
+pids=()
+success_count=0
+fail_count=0
+failed_users=()
+
+for user in "${users[@]}"; do
+  # enforce concurrency
+  while (( $(jobs -rp | wc -l) >= CONCURRENCY )); do
+    sleep 0.05
+  done
+
+  (
+    # per-worker rate limit: sleep a tiny randomized amount to smooth bursts
+    sleep_time=$(awk -v r="$RATE_PER_SEC" 'BEGIN{s=(1.0/r); print s*(0.5+rand()*0.5)}')
+    # shell math: convert to seconds float for sleep using printf
+    sleep "$sleep_time" 2>/dev/null || sleep 0
+
+    if process_user "$user"; then
+      exit 0
+    else
+      exit 2
+    fi
+  ) &
+done
+
+# wait for all workers and collect statuses
+for jobpid in $(jobs -rp); do
+  wait "$jobpid" || rc=$?
+  if [[ "${rc:-0}" == "0" ]]; then
     ((success_count++))
   else
-    echo "FAILED (see output or check token/permissions)"
-    failed_users+=("$user")
     ((fail_count++))
+    # we don't have the username here; for simplicity, advise checking log for failed entries
   fi
-done < "$USERS_FILE"
+  rc=0
+done
 
-printf '\nSummary: %d succeeded, %d failed\n' "$success_count" "$fail_count"
+log "Completed: ${success_count} succeeded, ${fail_count} failed. See ${LOG_FILE} for details."
+
+# rotate logs if needed at end
+rotate_logs_if_needed
+
+# exit with non-zero if any failures
 if (( fail_count > 0 )); then
-  echo "Failed users:"
-  for u in "${failed_users[@]}"; do
-    echo " - $u"
-  done
+  exit 2
 fi
-
-# Note: gh must be authenticated with a token that has permissions to manage blocking for your account.
-# If you see failures, check 'gh auth status' and GitHub docs for the appropriate token permissions.
